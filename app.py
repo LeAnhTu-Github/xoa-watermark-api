@@ -13,6 +13,7 @@ Kiến trúc: n8n Cloud Form (public) -> HTTP POST /clean -> ảnh sạch trả 
 import base64
 import io
 import json
+import re
 import sys
 import threading
 import time
@@ -237,8 +238,10 @@ def _prune_old_jobs(max_age_h: int = 24):
 
 
 @app.post("/batch")  # 200 (not 202): n8n HTTP node drops 202 responses -> 0 items
-async def batch_submit(request: Request):
-    """Nhận 1 file .zip HOẶC nhiều ảnh (multipart field bất kỳ) -> {job_id,...}."""
+async def batch_submit(request: Request, client_id: str = None):
+    """Nhận 1 file .zip HOẶC nhiều ảnh (multipart field bất kỳ) -> {job_id,...}.
+    client_id (optional): nếu truyền, dùng làm job_id luôn
+    (để n8n không cần đọc job_id từ response)."""
     form = await request.form()
     items: list[tuple[str, bytes]] = []
     for key, val in form.multi_items():
@@ -271,6 +274,8 @@ async def batch_submit(request: Request):
         raise HTTPException(413, "Tổng dung lượng batch vượt quá 300MB.")
 
     job_id = uuid.uuid4().hex[:12]
+    if client_id and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", client_id):
+        job_id = client_id  # n8n gui len de tu biet job_id, khong can doc response
     paths = _job_paths(job_id)
     paths["dir"].mkdir(parents=True, exist_ok=True)
     _write_status(job_id, status="queued", done=0, total=len(items),
