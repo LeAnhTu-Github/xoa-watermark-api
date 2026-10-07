@@ -396,3 +396,38 @@ async function send(file){
 @app.get("/", response_class=HTMLResponse)
 def index():
     return INDEX_HTML
+
+
+BATCH_UPLOAD_HTML = """<!DOCTYPE html><html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Xóa watermark hàng loạt</title>
+<style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:0 16px}
+#drop{border:2px dashed #888;border-radius:12px;padding:40px;text-align:center;cursor:pointer}
+img{max-width:100%;border-radius:8px;margin-top:12px}#meta{color:#555;font-size:14px}</style>
+</head><body>
+<h2>📦 Xóa watermark hàng loạt</h2>
+<p>Upload 1 file <b>.zip</b> chứa tối đa 100 ảnh sản phẩm (tổng &lt; 300MB). Hệ thống xử lý từng ảnh rồi gói thành 1 file ZIP để tải về.</p>
+<div id="drop">Thả file .zip vào đây hoặc bấm để chọn file</div>
+<input type="file" id="f" accept=".zip" hidden>
+<div id="meta"></div><div id="out"></div>
+<script>
+const d=document.getElementById('drop'),f=document.getElementById('f');
+d.onclick=()=>f.click();
+['dragover','drop'].forEach(e=>d.addEventListener(e,x=>{x.preventDefault();}));
+d.addEventListener('drop',x=>send(x.dataTransfer.files[0]));
+f.onchange=()=>send(f.files[0]);
+async function send(file){
+if(!file)return;
+document.getElementById('meta').textContent='Đang upload '+file.name+' ('+Math.round(file.size/1024)+' KB)...';
+const fd=new FormData();fd.append('file',file);
+const r=await fetch('/batch',{method:'POST',body:fd});
+if(!r.ok){document.getElementById('meta').textContent='Lỗi: '+r.status;return;}
+const j=await r.json();
+window.location='/batch/'+j.job_id+'/page';
+}
+</script></body></html>"""
+
+
+@app.get("/batch-upload", response_class=HTMLResponse)
+def batch_upload():
+    return BATCH_UPLOAD_HTML
