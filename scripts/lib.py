@@ -254,6 +254,25 @@ def detect_all(img_bgr: np.ndarray, attempt: int = 0,
     h, w = img_bgr.shape[:2]
     empty = np.zeros((h, w), dtype=bool)
     product = product_mask_yellow(img_bgr)
+    # Filter product mask: remove THIN components (watermark text strokes
+    # in yellow/orange hues, e.g. "ToolJapan.net"). Real product parts
+    # (handles) are thick solid areas. Without this, orange text is
+    # misclassified as product, blowing up the on_product region
+    # (2026-10-07: 33k px on_product mask from text-as-product).
+    # Two-stage: (1) drop thin isolated components; (2) erode to disconnect
+    # text sitting ON the handle surface from the handle core, then dilate
+    # back partially. Text on the boundary is removed, handle core remains.
+    _prod_filtered = np.zeros_like(product)
+    for _comp in components(product.astype(np.uint8), 200):
+        _dt = cv2.distanceTransform(_comp.astype(np.uint8), cv2.DIST_L2, 3)
+        if float(_dt.max()) > 12.0:  # >24px diameter: handle, not text
+            _prod_filtered |= _comp
+    if _prod_filtered.any():
+        # Erode 8px to cut text off the handle surface, dilate 3px back.
+        _core = erode_mask(_prod_filtered, 8)
+        if _core.any():
+            _prod_filtered = dilate_mask(_core, 3)
+        product = _prod_filtered
 
     icon_m, icon_p = detect_icon(img_bgr)
     icon_m = empty if icon_m is None else icon_m
@@ -283,7 +302,11 @@ def detect_all(img_bgr: np.ndarray, attempt: int = 0,
     # text pixels sitting on the product are not product-colored themselves.
     text_union = union([r["mask"] for r in regions
                         if r["strategy"] == "telea"])
-    product_region = dilate_mask(product, 10)
+    # Tight dilation (5px, was 10): the product_region defines where interp
+    # (not telea) is used. Too wide -> interp fills foam/metal with wrong
+    # colors, creating visible bands. 5px is enough to catch text sitting
+    # on the product edge.
+    product_region = dilate_mask(product, 5)
     prod_text = detect_product_text(img_bgr, product)
     combined_text = union([m for m in (text_union, prod_text)
                            if m is not None])
@@ -293,11 +316,27 @@ def detect_all(img_bgr: np.ndarray, attempt: int = 0,
             for r in regions:
                 if r["strategy"] == "telea":
                     r["mask"] = r["mask"] & ~product_region
-            # Wide dilate (10px): the work area must extend well beyond the
-            # text so the final feathered composite (6px) blends on clean
-            # background, never on text (which would make an orange halo).
-            regions.append({"mask": on_product, "strategy": "interp",
-                            "dilate": 10, "radius": 0, "kind": "on_product"})
+            # Choose strategy by stroke thickness (2026-10-07 upgrade):
+            # THIN text (<12px wide) -> telea with TIGHT mask (dilate 3).
+            #   Telea on thin strokes is invisible; the old 10px interp
+            #   band was visible on mixed backgrounds.
+            # THICK stamps/logos -> interp with moderate dilate (5).
+            #   Interp rebuilds large uniform areas better than Telea.
+            dt = cv2.distanceTransform(on_product.astype(np.uint8),
+                                       cv2.DIST_L2, 3)
+            # Thin text on/near product: telea with TIGHT mask (dilate 3).
+            # Thick stamps: interp (Voronoi for thin-mixed, vertical for
+            # thick-uniform) with moderate dilate (5).
+            # (2026-10-07: thin->telea avoids Voronoi artifacts on simple
+            # synthetic cases; thick->interp handles large stamps.)
+            if float(dt.max()) < 6.0:
+                regions.append({"mask": on_product, "strategy": "telea",
+                                "dilate": 3, "radius": 3,
+                                "kind": "on_product_thin"})
+            else:
+                regions.append({"mask": on_product, "strategy": "interp",
+                                "dilate": 5, "radius": 0,
+                                "kind": "on_product_thick"})
 
     # Escalation with attempt number: wider dilation catches faint halos.
     for r in regions:
@@ -309,54 +348,75 @@ def detect_all(img_bgr: np.ndarray, attempt: int = 0,
 # ---------------------------------------------------------------- rebuild
 def vertical_interp(img_bgr: np.ndarray, text_mask: np.ndarray,
                     product_region: np.ndarray) -> np.ndarray:
-    """Rebuild text pixels by vertical interpolation from clean pixels
-    above/below in the same column. Background-agnostic: works on any
-    vertically-consistent background (yellow product, silver metal,
-    black foam, ...).
+    """Rebuild text pixels using nearest-clean-pixel (Voronoi) fill.
+    Background-agnostic: each masked pixel takes the color of the nearest
+    clean pixel in ANY direction (not just vertical). Handles mixed
+    backgrounds (yellow handle | metal | foam) naturally.
 
-    For each contiguous work segment in a column, linearly interpolates
-    between the nearest clean pixel above and below. Falls back to
-    nearest-clean when only one side exists.
+    For each contiguous work segment, if it's THIN (text stroke), use
+    Voronoi fill. If THICK (large area), fall back to vertical linear
+    interpolation (smoother for large uniform areas).
 
-    (2026-10-07 fix: the old version filled EVERYTHING with the yellow
-    product median, painting giant yellow smears on silver metal jaws
-    when the work mask extended beyond the yellow handles.)
+    (2026-10-07: vertical-only interp created visible bands on mixed
+    backgrounds. 2026-10-07 upgrade: Voronoi for thin, vertical for thick.)
     """
-    work = dilate_mask(text_mask & product_region, 2)
-    # Clean = not in work area and not in (dilated) text fringe.
-    text_dil = dilate_mask(text_mask, 3)
+    # work is the caller-dilated mask; do NOT dilate again here (2026-10-07:
+    # double dilation made the fill band too wide, pulling wrong background).
+    work = (text_mask & product_region)
+    if not work.any():
+        return img_bgr.copy()
+    # Fringe exclusion: text pixels (1px dilate) are not "clean".
+    text_dil = dilate_mask(text_mask, 1)
     blocked = work | text_dil
     out = img_bgr.copy()
+    H, W = img_bgr.shape[:2]
 
-    for x in np.where(work.any(axis=0))[0]:
-        col_work = work[:, x]
-        col_blocked = blocked[:, x]
-        # Contiguous work segments in this column.
-        padded = np.concatenate([[False], col_work, [False]])
-        diff = np.diff(padded.astype(np.int8))
-        starts = np.where(diff == 1)[0]
-        ends = np.where(diff == -1)[0] - 1
+    # Check thickness: thin -> Voronoi, thick -> vertical interp
+    dt = cv2.distanceTransform(work.astype(np.uint8), cv2.DIST_L2, 3)
+    is_thin = float(dt.max()) < 8.0
 
-        for y0, y1 in zip(starts, ends):
-            above_idx = np.where(~col_blocked[:y0])[0]
-            ya = above_idx[-1] if len(above_idx) > 0 else None
-            below_rel = np.where(~col_blocked[y1 + 1:])[0]
-            yb = (y1 + 1 + below_rel[0]) if len(below_rel) > 0 else None
-
-            if ya is not None and yb is not None:
-                va = img_bgr[ya, x].astype(np.float32)
-                vb = img_bgr[yb, x].astype(np.float32)
-                ys = np.arange(y0, y1 + 1)
-                t = (ys - ya) / float(yb - ya)
-                interp = (va[None, :] * (1 - t[:, None])
-                          + vb[None, :] * t[:, None])
-                out[y0:y1 + 1, x] = np.clip(interp, 0, 255).astype(np.uint8)
-            elif ya is not None:
-                out[y0:y1 + 1, x] = img_bgr[ya, x]
-            elif yb is not None:
-                out[y0:y1 + 1, x] = img_bgr[yb, x]
-            # else: no clean pixel in column; leave for feather_blend.
-
+    if is_thin:
+        # Voronoi: nearest clean pixel for each work pixel.
+        # distanceTransformWithLabels on the CLEAN mask gives, for every
+        # pixel, the label (linear index) of the nearest clean pixel.
+        clean = (~blocked).astype(np.uint8)
+        # Need at least one clean pixel
+        if clean.any():
+            _, labels = cv2.distanceTransformWithLabels(
+                clean, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+            # labels is int32, each value is y*W + x of nearest clean
+            ys = (labels // W).astype(np.intp)
+            xs = (labels % W).astype(np.intp)
+            # Clip to bounds (safety)
+            np.clip(ys, 0, H - 1, out=ys)
+            np.clip(xs, 0, W - 1, out=xs)
+            out[work] = img_bgr[ys[work], xs[work]]
+    else:
+        # Thick: vertical linear interpolation per column (smooth).
+        for x in np.where(work.any(axis=0))[0]:
+            col_work = work[:, x]
+            col_blocked = blocked[:, x]
+            padded = np.concatenate([[False], col_work, [False]])
+            diff = np.diff(padded.astype(np.int8))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0] - 1
+            for y0, y1 in zip(starts, ends):
+                above_idx = np.where(~col_blocked[:y0])[0]
+                ya = above_idx[-1] if len(above_idx) > 0 else None
+                below_rel = np.where(~col_blocked[y1 + 1:])[0]
+                yb = (y1 + 1 + below_rel[0]) if len(below_rel) > 0 else None
+                if ya is not None and yb is not None:
+                    va = img_bgr[ya, x].astype(np.float32)
+                    vb = img_bgr[yb, x].astype(np.float32)
+                    ys = np.arange(y0, y1 + 1)
+                    t = (ys - ya) / float(yb - ya)
+                    interp = (va[None, :] * (1 - t[:, None])
+                              + vb[None, :] * t[:, None])
+                    out[y0:y1 + 1, x] = np.clip(interp, 0, 255).astype(np.uint8)
+                elif ya is not None:
+                    out[y0:y1 + 1, x] = img_bgr[ya, x]
+                elif yb is not None:
+                    out[y0:y1 + 1, x] = img_bgr[yb, x]
     return out
 
 
@@ -535,10 +595,44 @@ def run_pipeline(img_bgr: np.ndarray, attempt: int = 0,
     lama_used = False
 
     t = time.perf_counter()
-    for r in crop_regions:
+    # Merge overlapping telea regions and inpaint the UNION once.
+    # Sequential per-region inpaint causes fringe artifacts when masks
+    # overlap (2026-10-07: red "JAPAN" had red fringe because corner_dark
+    # and colored masks overlapped but were inpainted separately).
+    telea_rs = [r for r in crop_regions if r["strategy"] == "telea"]
+    other_rs = [r for r in crop_regions if r["strategy"] != "telea"]
+    if telea_rs:
+        telea_union = union([r["mask"] for r in telea_rs])
+        max_radius = max(r["radius"] for r in telea_rs)
+        if telea_union is not None and telea_union.any():
+            if attempt >= 2 and lama_model is not None:
+                lama_out = lama_inpaint(work, telea_union, lama_model)
+                if lama_out is not None:
+                    w = cv2.GaussianBlur(telea_union.astype(np.float32),
+                                         (0, 0), 3.0)[..., None]
+                    work = (work.astype(np.float32) * (1 - w)
+                            + lama_out.astype(np.float32) * w)
+                    work = np.clip(work, 0, 255).astype(np.uint8)
+                    methods.add("lama")
+                    lama_used = True
+                else:
+                    m8 = telea_union.astype(np.uint8) * 255
+                    passes = 2 if attempt >= 1 else 1
+                    for _ in range(passes):
+                        work = cv2.inpaint(work, m8, max_radius,
+                                           cv2.INPAINT_TELEA)
+                    methods.add("telea")
+            else:
+                m8 = telea_union.astype(np.uint8) * 255
+                passes = 2 if attempt >= 1 else 1
+                for _ in range(passes):
+                    work = cv2.inpaint(work, m8, max_radius,
+                                       cv2.INPAINT_TELEA)
+                methods.add("telea")
+    for r in other_rs:
         m8 = r["mask"].astype(np.uint8) * 255
         if r["strategy"] == "interp":
-            prod_reg = dilate_mask(product_mask_yellow(work), 10)
+            prod_reg = dilate_mask(product_mask_yellow(work), 5)
             work = vertical_interp(work, r["mask"], prod_reg)
             methods.add("interp")
         elif r["strategy"] == "transplant":
@@ -549,23 +643,6 @@ def run_pipeline(img_bgr: np.ndarray, attempt: int = 0,
             else:
                 work = t_res
                 methods.add("transplant")
-        else:  # telea (with attempt escalation)
-            if attempt >= 2 and lama_model is not None:
-                lama_out = lama_inpaint(work, r["mask"], lama_model)
-                if lama_out is not None:
-                    # blend LaMa result only inside this region
-                    w = cv2.GaussianBlur(r["mask"].astype(np.float32),
-                                         (0, 0), 3.0)[..., None]
-                    work = (work.astype(np.float32) * (1 - w)
-                            + lama_out.astype(np.float32) * w)
-                    work = np.clip(work, 0, 255).astype(np.uint8)
-                    methods.add("lama")
-                    lama_used = True
-                    continue
-            passes = 2 if attempt >= 1 else 1
-            for _ in range(passes):
-                work = cv2.inpaint(work, m8, r["radius"], cv2.INPAINT_TELEA)
-            methods.add("telea")
     stages["inpaint"] = (time.perf_counter() - t) * 1000
 
     t = time.perf_counter()
