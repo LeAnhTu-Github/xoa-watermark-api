@@ -38,6 +38,7 @@ def main() -> int:
 
     cleaned = cv2.imread(args.cleaned, cv2.IMREAD_COLOR)
     mask = cv2.imread(args.mask, cv2.IMREAD_GRAYSCALE)
+    orig = cv2.imread(args.original, cv2.IMREAD_COLOR)
     if cleaned is None:
         print(json.dumps({"ok": False,
                           "error": f"could not read cleaned: {args.cleaned}"}))
@@ -50,7 +51,7 @@ def main() -> int:
         mask = cv2.resize(mask, (cleaned.shape[1], cleaned.shape[0]),
                           interpolation=cv2.INTER_NEAREST)
 
-    res = qc_metrics(cleaned, mask)
+    res = qc_metrics(cleaned, mask, orig_bgr=orig)
     log(f"qc {Path(args.cleaned).name}: score={res['score']} "
         f"pass={res['pass']} checks={res['checks']}")
     print(json.dumps(res))
