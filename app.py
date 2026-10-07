@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
-from fastapi import FastAPI, File, HTTPException, UploadFile  # noqa: E402
+from fastapi import FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.responses import HTMLResponse, Response  # noqa: E402
 
 from lib import find_lama_model, log, qc_metrics, run_pipeline  # noqa: E402
@@ -66,18 +66,54 @@ def health():
     return {"ok": True}
 
 
+@app.post("/debug")
+async def debug(request: Request):
+    """Echo back what the request carried — for diagnosing client issues."""
+    form = await request.form()
+    fields = []
+    for key, val in form.multi_items():
+        if hasattr(val, "read"):
+            data = await val.read()
+            fields.append({
+                "field": key,
+                "filename": getattr(val, "filename", None),
+                "content_type": getattr(val, "content_type", None),
+                "bytes": len(data),
+            })
+        else:
+            fields.append({"field": key, "value": str(val)[:200]})
+    return {"fields": fields, "content_type": request.headers.get("content-type")}
+
+
 @app.post("/clean")
-async def clean(image: UploadFile = File(...), format: str = "image"):
-    if not (image.content_type or "").startswith("image/"):
-        raise HTTPException(400, "File phải là ảnh (image/*).")
-    data = await image.read()
+async def clean(request: Request, format: str = "image"):
+    # Lenient: accept the image from ANY multipart field (n8n/Zapier/etc.
+    # may use different field names). Also accept raw body as fallback.
+    form = await request.form()
+    data: bytes | None = None
+    field_name = ""
+    for key, val in form.multi_items():
+        if hasattr(val, "read"):
+            data = await val.read()
+            field_name = key
+            break
+    if data is None:
+        body = await request.body()
+        if body:
+            data, field_name = body, "raw-body"
+    if not data:
+        raise HTTPException(400, "Không nhận được file ảnh nào (gửi multipart field bất kỳ).")
     if len(data) > MAX_BYTES:
         raise HTTPException(413, "Ảnh vượt quá 10MB.")
     arr = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise HTTPException(400, "Không đọc được ảnh.")
-    out = clean_image(img)
+        raise HTTPException(400, "Không đọc được ảnh (bytes không phải định dạng ảnh).")
+    try:
+        out = clean_image(img)
+    except Exception as e:  # noqa: BLE001 - never 500 silently; log + report
+        log(f"clean_image failed on field {field_name!r}: {e!r}")
+        raise HTTPException(500, f"Lỗi xử lý ảnh: {type(e).__name__}")
     ok, buf = cv2.imencode(".jpg", out["cleaned_bgr"],
                            [cv2.IMWRITE_JPEG_QUALITY, 95])
     if not ok:
