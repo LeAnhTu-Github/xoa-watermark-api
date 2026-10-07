@@ -236,7 +236,7 @@ def _prune_old_jobs(max_age_h: int = 24):
                 pass
 
 
-@app.post("/batch", status_code=202)
+@app.post("/batch")  # 200 (not 202): n8n HTTP node drops 202 responses -> 0 items
 async def batch_submit(request: Request):
     """Nhận 1 file .zip HOẶC nhiều ảnh (multipart field bất kỳ) -> {job_id,...}."""
     form = await request.form()
