@@ -183,7 +183,20 @@ def detect_colored(img_bgr: np.ndarray, product_mask: np.ndarray,
         # This detector is for COLORED text; gray object edges (low
         # saturation) belong to the product, not a watermark. Gray text is
         # covered by the corner_dark / engraved detectors.
-        if float(sat[comp].mean()) < 25:
+        # Use FRACTION of saturated pixels (not mean): a metal-grain+text
+        # mixture can have high mean saturation from the text part while
+        # being mostly gray metal. Require a true majority saturated.
+        # (2026-10-07: mean-based check let 39k px of brushed metal through
+        # on pliers photo, destroying the image.)
+        sat_frac = float((sat[comp] > 50).mean())
+        if sat_frac < 0.6:
+            continue
+        # Text strokes are THIN. If a large fraction of the component is
+        # thick (>16px diameter via distance transform), it's background
+        # texture merged with text, not text itself.
+        dt = cv2.distanceTransform(comp.astype(np.uint8), cv2.DIST_L2, 3)
+        thick_frac = float((dt > 8).mean())
+        if thick_frac > 0.25:
             continue
         found.append(comp)
     return union(found), {"dilate": 3, "radius": 3, "kind": "colored_text"}
@@ -296,40 +309,54 @@ def detect_all(img_bgr: np.ndarray, attempt: int = 0,
 # ---------------------------------------------------------------- rebuild
 def vertical_interp(img_bgr: np.ndarray, text_mask: np.ndarray,
                     product_region: np.ndarray) -> np.ndarray:
-    """Rebuild text pixels sitting on a smooth product by vertical
-    interpolation: each column is filled with the median of the clean
-    product pixels above/below (robust to outliers).
+    """Rebuild text pixels by vertical interpolation from clean pixels
+    above/below in the same column. Background-agnostic: works on any
+    vertically-consistent background (yellow product, silver metal,
+    black foam, ...).
 
-    product_region is the dilated product LOCATION mask; the actual clean
-    product pixels are re-derived by color (yellow) minus the text area.
+    For each contiguous work segment in a column, linearly interpolates
+    between the nearest clean pixel above and below. Falls back to
+    nearest-clean when only one side exists.
+
+    (2026-10-07 fix: the old version filled EVERYTHING with the yellow
+    product median, painting giant yellow smears on silver metal jaws
+    when the work mask extended beyond the yellow handles.)
     """
     work = dilate_mask(text_mask & product_region, 2)
-    prod_color = product_mask_yellow(img_bgr) & ~dilate_mask(text_mask, 3)
+    # Clean = not in work area and not in (dilated) text fringe.
+    text_dil = dilate_mask(text_mask, 3)
+    blocked = work | text_dil
     out = img_bgr.copy()
-    prod_pixels = img_bgr[prod_color & ~work]
-    global_med = (np.median(prod_pixels.astype(np.float32), axis=0)
-                  if len(prod_pixels) else np.array([128, 128, 128]))
+
     for x in np.where(work.any(axis=0))[0]:
-        rows = np.where(work[:, x])[0]
-        clean = prod_color[:, x] & ~work[:, x]
-        if int(clean.sum()) >= 3:
-            med = np.median(img_bgr[clean, x].astype(np.float32), axis=0)
-        else:
-            # fallback: nearest column that has clean product pixels
-            med = None
-            for d in range(1, 60):
-                for xx in (x - d, x + d):
-                    if 0 <= xx < img_bgr.shape[1]:
-                        c2 = prod_color[:, xx] & ~work[:, xx]
-                        if int(c2.sum()) >= 3:
-                            med = np.median(
-                                img_bgr[c2, xx].astype(np.float32), axis=0)
-                            break
-                if med is not None:
-                    break
-            if med is None:
-                med = global_med
-        out[rows, x] = np.clip(med, 0, 255).astype(np.uint8)
+        col_work = work[:, x]
+        col_blocked = blocked[:, x]
+        # Contiguous work segments in this column.
+        padded = np.concatenate([[False], col_work, [False]])
+        diff = np.diff(padded.astype(np.int8))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0] - 1
+
+        for y0, y1 in zip(starts, ends):
+            above_idx = np.where(~col_blocked[:y0])[0]
+            ya = above_idx[-1] if len(above_idx) > 0 else None
+            below_rel = np.where(~col_blocked[y1 + 1:])[0]
+            yb = (y1 + 1 + below_rel[0]) if len(below_rel) > 0 else None
+
+            if ya is not None and yb is not None:
+                va = img_bgr[ya, x].astype(np.float32)
+                vb = img_bgr[yb, x].astype(np.float32)
+                ys = np.arange(y0, y1 + 1)
+                t = (ys - ya) / float(yb - ya)
+                interp = (va[None, :] * (1 - t[:, None])
+                          + vb[None, :] * t[:, None])
+                out[y0:y1 + 1, x] = np.clip(interp, 0, 255).astype(np.uint8)
+            elif ya is not None:
+                out[y0:y1 + 1, x] = img_bgr[ya, x]
+            elif yb is not None:
+                out[y0:y1 + 1, x] = img_bgr[yb, x]
+            # else: no clean pixel in column; leave for feather_blend.
+
     return out
 
 
@@ -570,7 +597,8 @@ def run_pipeline(img_bgr: np.ndarray, attempt: int = 0,
 
 
 # ---------------------------------------------------------------- QC
-def qc_metrics(cleaned_bgr: np.ndarray, mask: np.ndarray) -> dict:
+def qc_metrics(cleaned_bgr: np.ndarray, mask: np.ndarray,
+               orig_bgr: np.ndarray | None = None) -> dict:
     """Score a cleaned image against its mask.
 
     Checks:
@@ -580,14 +608,33 @@ def qc_metrics(cleaned_bgr: np.ndarray, mask: np.ndarray) -> dict:
                  catches blurry/visible rims.
       blur     - Laplacian variance inside the inpainted region vs the ring;
                  catches over-smoothed smudges.
+      fidelity - (needs orig_bgr) fraction of pixels OUTSIDE the mask that
+                 changed drastically vs the original. Catches catastrophic
+                 destruction of product/background that the mask-local
+                 checks are blind to.
     Returns {pass, score, checks, reasons}.
     """
     m = (mask > 127) if mask.dtype != bool else mask
     m = m.astype(bool)
     if int(m.sum()) == 0:
-        return {"pass": True, "score": 100.0,
-                "checks": {"residual": 100.0, "halo": 100.0, "blur": 100.0},
-                "reasons": []}
+        # No mask: still check fidelity if we have the original.
+        fidelity = 100.0
+        if orig_bgr is not None and orig_bgr.shape == cleaned_bgr.shape:
+            diff0 = np.linalg.norm(
+                cleaned_bgr.astype(np.float32) - orig_bgr.astype(np.float32),
+                axis=2)
+            changed0 = float((diff0 > 60).mean())
+            fidelity = 100.0 * max(0.0, 1.0 - max(0.0, changed0 - 0.002) * 30.0)
+        ok = bool(fidelity >= 70.0)
+        reasons0 = []
+        if not ok:
+            reasons0.append(
+                f"image destroyed outside watermark area: "
+                f"{changed0*100:.1f}% of pixels changed drastically")
+        return {"pass": ok, "score": round(fidelity, 1),
+                "checks": {"residual": 100.0, "halo": 100.0,
+                           "blur": 100.0, "fidelity": round(fidelity, 1)},
+                "reasons": reasons0}
 
     core = erode_mask(m, 3)
     if int(core.sum()) == 0:
@@ -654,9 +701,38 @@ def qc_metrics(cleaned_bgr: np.ndarray, mask: np.ndarray) -> dict:
     if blur < 70:
         reasons.append(f"repaired area over-blurred vs surroundings (laplacian var ratio {lratio:.2f})")
 
-    score = 0.5 * residual + 0.25 * halo + 0.25 * blur
-    return {"pass": bool(score >= 70.0), "score": round(score, 1),
+    # --- fidelity: did the pipeline destroy non-watermark areas?
+    # Compares cleaned vs ORIGINAL outside the dilated mask. The pipeline
+    # must only touch pixels inside/near the mask (feather_blend guarantees
+    # bit-identical output beyond ~6px). Large changes outside mean
+    # catastrophic smearing of product/background.
+    # (2026-10-07: giant yellow smears on pliers' metal jaws passed
+    # residual/halo/blur because those checks only inspect inside/around
+    # the mask. This check would have failed it.)
+    fidelity = 100.0
+    changed_frac = 0.0
+    if orig_bgr is not None and orig_bgr.shape == cleaned_bgr.shape:
+        diff = np.linalg.norm(
+            cleaned_bgr.astype(np.float32) - orig_bgr.astype(np.float32),
+            axis=2)
+        outside = ~dilate_mask(m, 15)
+        if outside.any():
+            changed_frac = float((diff[outside] > 60).mean())
+            # Allow 0.2% numerical noise; 1% destroyed -> 76, 2% -> 46,
+            # 3.5%+ -> 0. Hard-fails catastrophes.
+            fidelity = 100.0 * max(
+                0.0, 1.0 - max(0.0, changed_frac - 0.002) * 30.0)
+    if fidelity < 70:
+        reasons.append(
+            f"image destroyed outside watermark area: "
+            f"{changed_frac*100:.1f}% of non-mask pixels changed drastically")
+
+    score = (0.4 * residual + 0.2 * halo + 0.2 * blur + 0.2 * fidelity)
+    # Fidelity is a catastrophe gate: never pass if we wrecked the image.
+    passed = bool(score >= 70.0 and fidelity >= 50.0)
+    return {"pass": passed, "score": round(score, 1),
             "checks": {"residual": round(residual, 1),
                        "halo": round(halo, 1),
-                       "blur": round(blur, 1)},
+                       "blur": round(blur, 1),
+                       "fidelity": round(fidelity, 1)},
             "reasons": reasons}
